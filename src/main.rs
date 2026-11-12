@@ -59,12 +59,14 @@ fn report_checks(forecast: WeatherResponse, uv_threshold: f64) {
     let need_umbrella = need_umbrella(&forecast);
     let details = need_umbrella
         .iter()
-        .map(|(_, reason, probability)| format!("{}: {:.0}% regn", reason, probability * 100.))
+        .map(|(_, reason, probability, kind)| {
+            format!("{}: {:.0}% {}", reason, probability * 100., kind)
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let rain_severity = need_umbrella
         .iter()
-        .map(|(_, _, probability)| *probability)
+        .map(|(_, _, probability, _)| *probability)
         .fold(0., f64::max);
     let (uv_max, uv_ranges) = uv_today(&forecast, uv_threshold);
     let response = json!({
@@ -105,31 +107,51 @@ fn within_window(dt: i64, now: i64) -> bool {
     dt < now + FORECAST_WINDOW_SECS
 }
 
-type UmbrellaCheck = Vec<(bool, String, f64)>;
+type UmbrellaCheck = Vec<(bool, String, f64, &'static str)>;
+
+fn falls(p: &Option<openwearther_response::Rain1h>) -> bool {
+    p.as_ref().is_some_and(|h| h.hour1 > 0.)
+}
+
+/// "regn", "sne" or "regn/sne": what falls. Snow alone only when snow is forecast and rain is not.
+fn precipitation_kind(rain: bool, snow: bool) -> &'static str {
+    match (rain, snow) {
+        (false, true) => "sne",
+        (true, true) => "regn/sne",
+        _ => "regn",
+    }
+}
 
 fn need_umbrella(weather_response: &WeatherResponse) -> UmbrellaCheck {
     let offset = weather_response.timezone_offset;
     let now = weather_response.current.dt;
     let mut results: UmbrellaCheck = Vec::new();
 
-    if weather_response.current.rain.is_some() {
-        results.push((true, "Rain now".to_string(), 1.));
+    let current = &weather_response.current;
+    if current.rain.is_some() || current.snow.is_some() {
+        let kind = precipitation_kind(current.rain.is_some(), current.snow.is_some());
+        let reason = match kind {
+            "sne" => "Snow now",
+            "regn/sne" => "Rain/snow now",
+            _ => "Rain now",
+        };
+        results.push((true, reason.to_string(), 1., kind));
     }
 
     for hour in &weather_response.hourly {
         if !within_window(hour.dt, now) {
             continue;
         }
-        if hour.pop > 0.5
-            || hour
-                .rain
-                .as_ref()
-                .map_or(false, |h: &openwearther_response::Rain1h| h.hour1 > 0.)
-        {
+        let rain = falls(&hour.rain);
+        let snow = falls(&hour.snow);
+        if hour.pop > 0.5 || rain || snow {
+            // Weather condition 6xx is snow (https://openweathermap.org/weather-conditions):
+            // it names what a likely-but-unmeasured hour will bring.
+            let snow = snow || hour.weather.iter().any(|w| (600..700).contains(&w.id));
             let time = local_time(hour.dt, offset);
             let plus1h = time + Duration::hours(1);
             let range = format!("{}-{}", time.format("%a %H:%M"), plus1h.format("%H:%M"));
-            results.push((true, range, hour.pop));
+            results.push((true, range, hour.pop, precipitation_kind(rain, snow)));
         }
     }
 
@@ -173,4 +195,86 @@ fn uv_today(weather_response: &WeatherResponse, threshold: f64) -> (f64, Vec<Str
         .collect();
 
     (uv_max, details)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> serde_json::Value {
+        serde_json::from_str(include_str!("../sample-response.json")).unwrap()
+    }
+
+    fn dry(v: &mut serde_json::Value) {
+        let current = v["current"].as_object_mut().unwrap();
+        current.remove("rain");
+        current.remove("snow");
+        for h in v["hourly"].as_array_mut().unwrap() {
+            let h = h.as_object_mut().unwrap();
+            h.remove("rain");
+            h.remove("snow");
+            h.insert("pop".into(), serde_json::json!(0.0));
+            h.insert("weather".into(), serde_json::json!([{"id": 800, "main": "Clear", "description": "clear sky", "icon": "01d"}]));
+        }
+    }
+
+    fn check(v: serde_json::Value) -> UmbrellaCheck {
+        need_umbrella(&serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn dry_forecast_needs_no_umbrella() {
+        let mut v = sample();
+        dry(&mut v);
+        assert!(check(v).is_empty());
+    }
+
+    #[test]
+    fn snow_in_an_hour_counts() {
+        let mut v = sample();
+        dry(&mut v);
+        v["hourly"][1]["snow"] = serde_json::json!({"1h": 0.3});
+        let r = check(v);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].3, "sne");
+    }
+
+    #[test]
+    fn snow_condition_without_amount_counts_when_likely() {
+        let mut v = sample();
+        dry(&mut v);
+        v["hourly"][2]["pop"] = serde_json::json!(0.8);
+        v["hourly"][2]["weather"][0]["id"] = serde_json::json!(601);
+        let r = check(v);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].3, "sne");
+    }
+
+    #[test]
+    fn snow_now_counts() {
+        let mut v = sample();
+        dry(&mut v);
+        v["current"]["snow"] = serde_json::json!({"1h": 0.5});
+        let r = check(v);
+        assert_eq!(r[0].1, "Snow now");
+        assert_eq!(r[0].3, "sne");
+    }
+
+    #[test]
+    fn snow_condition_alone_is_not_enough() {
+        let mut v = sample();
+        dry(&mut v);
+        v["hourly"][2]["pop"] = serde_json::json!(0.3);
+        v["hourly"][2]["weather"][0]["id"] = serde_json::json!(600);
+        assert!(check(v).is_empty());
+    }
+
+    #[test]
+    fn rain_and_snow_together() {
+        let mut v = sample();
+        dry(&mut v);
+        v["hourly"][1]["rain"] = serde_json::json!({"1h": 0.2});
+        v["hourly"][1]["snow"] = serde_json::json!({"1h": 0.1});
+        assert_eq!(check(v)[0].3, "regn/sne");
+    }
 }
