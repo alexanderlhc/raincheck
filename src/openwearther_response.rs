@@ -29,12 +29,12 @@ pub struct CurrentWeather {
     pub dew_point: f64,
     pub uvi: f64,
     pub clouds: i32,
-    pub visibility: i32,
+    pub visibility: Option<i32>,
     pub wind_speed: f64,
     pub wind_gust: Option<f64>,
     pub wind_deg: i32,
     pub rain: Option<Rain1h>, // Precipitation in mm/h
-    pub snow: Option<f64>,    // Precipitation in mm/h
+    pub snow: Option<Rain1h>, // Precipitation in mm/h, {"1h": x} like rain
     pub weather: Vec<WeatherCondition>,
 }
 
@@ -68,13 +68,13 @@ pub struct HourlyWeather {
     pub dew_point: f64,
     pub uvi: f64,
     pub clouds: i32,
-    pub visibility: i32,
+    pub visibility: Option<i32>,
     pub wind_speed: f64,
     pub wind_gust: Option<f64>,
     pub wind_deg: i32,
     pub pop: f64,             // Probability of precipitation (0 to 1)
     pub rain: Option<Rain1h>, // Precipitation in mm/h
-    pub snow: Option<f64>,    // Precipitation in mm/h
+    pub snow: Option<Rain1h>, // Precipitation in mm/h, {"1h": x} like rain
     pub weather: Vec<WeatherCondition>,
 }
 
@@ -142,4 +142,21 @@ pub struct WeatherAlert {
 pub struct Rain1h {
     #[serde(rename = "1h")]
     pub hour1: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // OpenWeather sends current and hourly snow as {"1h": x}, like rain; daily snow is a plain number.
+    #[test]
+    fn parses_snow_in_current_and_hourly() {
+        let mut v: serde_json::Value =
+            serde_json::from_str(include_str!("../sample-response.json")).unwrap();
+        v["current"]["snow"] = serde_json::json!({"1h": 0.4});
+        v["hourly"][0]["snow"] = serde_json::json!({"1h": 0.25});
+        let r: WeatherResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(r.current.snow.unwrap().hour1, 0.4);
+        assert_eq!(r.hourly[0].snow.as_ref().unwrap().hour1, 0.25);
+    }
 }
