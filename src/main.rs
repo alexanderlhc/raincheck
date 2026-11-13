@@ -97,14 +97,17 @@ async fn get_todays_forecast(config: &Config) -> Result<WeatherResponse, String>
     }
 }
 
-const FORECAST_WINDOW_SECS: i64 = 24 * 3600;
+const DAY_SECS: i64 = 24 * 3600;
 
 fn local_time(dt: i64, offset: i32) -> DateTime<Utc> {
     DateTime::from_timestamp(dt + offset as i64, 0).unwrap()
 }
 
-fn within_window(dt: i64, now: i64) -> bool {
-    dt < now + FORECAST_WINDOW_SECS
+/// The rest of today: hours that start before the coming local midnight.
+fn within_window(dt: i64, now: i64, offset: i32) -> bool {
+    let offset = offset as i64;
+    let midnight = ((now + offset).div_euclid(DAY_SECS) + 1) * DAY_SECS - offset;
+    dt < midnight
 }
 
 type UmbrellaCheck = Vec<(bool, String, f64, &'static str)>;
@@ -139,7 +142,7 @@ fn need_umbrella(weather_response: &WeatherResponse) -> UmbrellaCheck {
     }
 
     for hour in &weather_response.hourly {
-        if !within_window(hour.dt, now) {
+        if !within_window(hour.dt, now, offset) {
             continue;
         }
         let rain = falls(&hour.rain);
@@ -167,7 +170,7 @@ fn uv_today(weather_response: &WeatherResponse, threshold: f64) -> (f64, Vec<Str
     let mut ranges: Vec<(i64, i64, f64)> = Vec::new(); // start, end, peak
 
     for hour in &weather_response.hourly {
-        if !within_window(hour.dt, now) {
+        if !within_window(hour.dt, now, offset) {
             continue;
         }
         uv_max = uv_max.max(hour.uvi);
@@ -243,8 +246,8 @@ mod tests {
     fn snow_condition_without_amount_counts_when_likely() {
         let mut v = sample();
         dry(&mut v);
-        v["hourly"][2]["pop"] = serde_json::json!(0.8);
-        v["hourly"][2]["weather"][0]["id"] = serde_json::json!(601);
+        v["hourly"][1]["pop"] = serde_json::json!(0.8);
+        v["hourly"][1]["weather"][0]["id"] = serde_json::json!(601);
         let r = check(v);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].3, "sne");
@@ -264,8 +267,8 @@ mod tests {
     fn snow_condition_alone_is_not_enough() {
         let mut v = sample();
         dry(&mut v);
-        v["hourly"][2]["pop"] = serde_json::json!(0.3);
-        v["hourly"][2]["weather"][0]["id"] = serde_json::json!(600);
+        v["hourly"][1]["pop"] = serde_json::json!(0.3);
+        v["hourly"][1]["weather"][0]["id"] = serde_json::json!(600);
         assert!(check(v).is_empty());
     }
 
@@ -276,5 +279,48 @@ mod tests {
         v["hourly"][1]["rain"] = serde_json::json!({"1h": 0.2});
         v["hourly"][1]["snow"] = serde_json::json!({"1h": 0.1});
         assert_eq!(check(v)[0].3, "regn/sne");
+    }
+
+    // The sample's "now" is 22:06 local (UTC+2): hourly[1] is 22:00 today,
+    // hourly[2] is 00:00 tomorrow.
+    #[test]
+    fn rain_later_today_counts() {
+        let mut v = sample();
+        dry(&mut v);
+        v["hourly"][1]["rain"] = serde_json::json!({"1h": 0.4});
+        assert_eq!(check(v).len(), 1);
+    }
+
+    #[test]
+    fn rain_after_midnight_is_ignored() {
+        let mut v = sample();
+        dry(&mut v);
+        v["hourly"][2]["rain"] = serde_json::json!({"1h": 0.4});
+        v["hourly"][5]["pop"] = serde_json::json!(0.9);
+        assert!(check(v).is_empty());
+    }
+
+    #[test]
+    fn uv_after_midnight_is_ignored() {
+        let mut v = sample();
+        dry(&mut v);
+        v["current"]["uvi"] = serde_json::json!(0.0);
+        for h in v["hourly"].as_array_mut().unwrap() {
+            h["uvi"] = serde_json::json!(0.0);
+        }
+        v["hourly"][14]["uvi"] = serde_json::json!(6.0);
+        let (max, ranges) = uv_today(&serde_json::from_value(v).unwrap(), 3.0);
+        assert_eq!(max, 0.0);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn window_ends_at_local_midnight() {
+        // 2025-11-13 06:00 CET (05:00 UTC), offset +1h
+        let now = 1_763_010_000;
+        let offset = 3600;
+        let midnight_utc = 1_763_074_800; // 2025-11-13 23:00 UTC
+        assert!(within_window(midnight_utc - 3600, now, offset));
+        assert!(!within_window(midnight_utc, now, offset));
     }
 }
